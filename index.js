@@ -23,11 +23,17 @@ const defaultSettings = {
     modelColors: {}, // { "gpt-4o": "#6366f1", "claude-3-opus": "#8b5cf6", ... }
     // Prices per 1M tokens: { "gpt-4o": { in: 2.5, out: 10 }, ... }
     modelPrices: {},
+    // Cache simulation configuration
+    cacheSimulation: {
+        enabled: true,
+        minThreshold: 1024, // Min tokens to qualify for KV cache
+        ttlMinutes: 10,     // Cache TTL in minutes (0 = no expiration check)
+    },
     // Accumulated usage data (persisted in compact v2 form via storage.js; byDay/byModel
     // live only in the expanded runtime copy)
     usage: {
-        session: { input: 0, output: 0, total: 0, messageCount: 0, startTime: null },
-        allTime: { input: 0, output: 0, total: 0, messageCount: 0 },
+        session: { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0, startTime: null },
+        allTime: { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 },
     },
 };
 
@@ -45,6 +51,9 @@ function loadSettings() {
     const settings = extension_settings[extensionName];
     if (!settings.modelColors) settings.modelColors = {};
     if (!settings.modelPrices) settings.modelPrices = {};
+    if (!settings.cacheSimulation) {
+        settings.cacheSimulation = structuredClone(defaultSettings.cacheSimulation);
+    }
 
     // Usage is stored in compact v2 form; migrate older layouts once, then expand
     // into the runtime copy. Migration also drops the dead legacy buckets
@@ -144,15 +153,18 @@ async function countTokens(text) {
  * @param {string} [chatId] - Optional chat ID for per-chat tracking
  * @param {string} [modelId] - Optional model ID for per-model tracking
  * @param {{cost?: number|null, source?: string|null, hasTokenCounts?: boolean}} [apiUsage] - Optional API-reported usage metadata
+ * @param {number} [cacheReadTokens=0] - Tokens served from prompt cache
  */
-function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, apiUsage = {}) {
+function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, apiUsage = {}, cacheReadTokens = 0) {
     const usage = usageRuntime;
     const now = new Date();
-    const totalTokens = inputTokens + outputTokens;
+    const cr = Math.max(0, cacheReadTokens || 0);
+    const totalTokens = inputTokens + outputTokens + cr;
     const exactCost = Number.isFinite(apiUsage?.cost) ? apiUsage.cost : null;
 
     const addTokens = (bucket) => {
         bucket.input = (bucket.input || 0) + inputTokens;
+        bucket.cache_read = (bucket.cache_read || 0) + cr;
         bucket.output = (bucket.output || 0) + outputTokens;
         bucket.total = (bucket.total || 0) + totalTokens;
         bucket.messageCount = (bucket.messageCount || 0) + 1;
@@ -171,17 +183,18 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, a
 
     // By day
     const dayKey = getDayKey(now);
-    if (!usage.byDay[dayKey]) usage.byDay[dayKey] = { input: 0, output: 0, total: 0, messageCount: 0, models: {} };
+    if (!usage.byDay[dayKey]) usage.byDay[dayKey] = { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0, models: {} };
     addTokens(usage.byDay[dayKey]);
 
     // Track model within day for stacked chart (with input/output breakdown for cost calculation)
     if (modelId) {
         if (!usage.byDay[dayKey].models) usage.byDay[dayKey].models = {};
         if (!usage.byDay[dayKey].models[modelId]) {
-            usage.byDay[dayKey].models[modelId] = { input: 0, output: 0, total: 0, messageCount: 0 };
+            usage.byDay[dayKey].models[modelId] = { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 };
         }
         const modelData = usage.byDay[dayKey].models[modelId];
         modelData.input += inputTokens;
+        modelData.cache_read = (modelData.cache_read || 0) + cr;
         modelData.output += outputTokens;
         modelData.total += totalTokens;
         modelData.messageCount = (modelData.messageCount || 0) + 1;
@@ -194,7 +207,7 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, a
 
     // By model (aggregate)
     if (modelId) {
-        if (!usage.byModel[modelId]) usage.byModel[modelId] = { input: 0, output: 0, total: 0, messageCount: 0 };
+        if (!usage.byModel[modelId]) usage.byModel[modelId] = { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 };
         addTokens(usage.byModel[modelId]);
     }
 
@@ -203,14 +216,14 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, a
     // Emit custom event for UI updates
     eventSource.emit('tokenUsageUpdated', getUsageStats());
 
-    const estimatedCost = exactCost === null ? calculateCost(inputTokens, outputTokens, modelId) : 0;
+    const estimatedCost = exactCost === null ? calculateCost(inputTokens, outputTokens, modelId, cr) : 0;
     const costLog = exactCost !== null
         ? `, cost: $${exactCost.toFixed(6)} (reported by API)`
         : estimatedCost > 0
             ? `, cost: $${estimatedCost.toFixed(6)} (model pricing)`
             : '';
     const countSource = apiUsage?.hasTokenCounts ? 'reported by API' : `counted with ${getFriendlyTokenizerName(main_api).tokenizerName}`;
-    console.log(`[Token Usage Tracker] Recorded: +${inputTokens} input, +${outputTokens} output, model: ${modelId || 'unknown'}${costLog} (${countSource})`);
+    console.log(`[Token Usage Tracker] Recorded: +${inputTokens} input, +${cr} cache_read, +${outputTokens} output, model: ${modelId || 'unknown'}${costLog} (${countSource})`);
 }
 
 /**
@@ -266,8 +279,8 @@ function getUsageStats() {
     const now = new Date();
     const currentWeekKey = getWeekKey(now);
     const currentMonthKey = getMonthKey(now);
-    const thisWeek = { input: 0, output: 0, total: 0, messageCount: 0 };
-    const thisMonth = { input: 0, output: 0, total: 0, messageCount: 0 };
+    const thisWeek = { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 };
+    const thisMonth = { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 };
 
     // Get current tokenizer info for display
     let tokenizerInfo = { tokenizerName: 'Unknown' };
@@ -283,6 +296,7 @@ function getUsageStats() {
 
         if (getWeekKey(date) === currentWeekKey) {
             thisWeek.input += data.input || 0;
+            thisWeek.cache_read += data.cache_read || 0;
             thisWeek.output += data.output || 0;
             thisWeek.total += data.total || 0;
             thisWeek.messageCount += data.messageCount || 0;
@@ -290,6 +304,7 @@ function getUsageStats() {
 
         if (getMonthKey(date) === currentMonthKey) {
             thisMonth.input += data.input || 0;
+            thisMonth.cache_read += data.cache_read || 0;
             thisMonth.output += data.output || 0;
             thisMonth.total += data.total || 0;
             thisMonth.messageCount += data.messageCount || 0;
@@ -299,7 +314,7 @@ function getUsageStats() {
     return {
         session: { ...usage.session },
         allTime: { ...usage.allTime },
-        today: usage.byDay[getDayKey(now)] || { input: 0, output: 0, total: 0, messageCount: 0, models: {} },
+        today: usage.byDay[getDayKey(now)] || { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0, models: {} },
         thisWeek,
         thisMonth,
         currentChat: null, // Will be populated if context available
@@ -320,11 +335,12 @@ function getUsageStats() {
 function getUsageForRange(startDate, endDate) {
     const usage = usageRuntime;
 
-    const result = { input: 0, output: 0, total: 0, messageCount: 0 };
+    const result = { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 };
 
     for (const [day, data] of Object.entries(usage.byDay)) {
         if (day >= startDate && day <= endDate) {
             result.input += data.input || 0;
+            result.cache_read += data.cache_read || 0;
             result.output += data.output || 0;
             result.total += data.total || 0;
             result.messageCount += data.messageCount || 0;
@@ -335,27 +351,76 @@ function getUsageForRange(startDate, endDate) {
 }
 
 /**
- * Parses the OpenAI-compatible usage shape returned by Meta Model API.
+ * Parses the OpenAI/Anthropic-compatible usage shape returned by API.
+ * Extracts native cached token counts if present.
  * @param {any} apiUsage
- * @returns {{input: number, output: number, total: number, cost: number|null, source: string, hasTokenCounts: true}|null}
+ * @returns {{input: number, cache_read: number, output: number, total: number, rawPromptTokens: number, cost: number|null, source: string, hasTokenCounts: true, hasCacheTokens: boolean}|null}
  */
 function parseApiUsage(apiUsage) {
     if (!apiUsage || typeof apiUsage !== 'object') return null;
 
-    const input = apiUsage.prompt_tokens;
-    const output = apiUsage.completion_tokens;
-    const total = apiUsage.total_tokens;
+    let input = apiUsage.prompt_tokens;
+    let output = apiUsage.completion_tokens;
+    let total = apiUsage.total_tokens;
+
+    // Check for Anthropic style tokens (input_tokens, output_tokens)
+    if (input === undefined && typeof apiUsage.input_tokens === 'number') {
+        input = apiUsage.input_tokens;
+    }
+    if (output === undefined && typeof apiUsage.output_tokens === 'number') {
+        output = apiUsage.output_tokens;
+    }
+
     if (typeof input !== 'number' || !Number.isFinite(input) || input < 0
-        || typeof output !== 'number' || !Number.isFinite(output) || output < 0
-        || typeof total !== 'number' || !Number.isFinite(total) || total < 0) {
+        || typeof output !== 'number' || !Number.isFinite(output) || output < 0) {
         return null;
+    }
+
+    // Check for native prompt cache tokens from various providers:
+    // 1. OpenAI / One-API: prompt_tokens_details.cached_tokens or cached_tokens
+    // 2. Anthropic: cache_read_input_tokens
+    // 3. DeepSeek: prompt_cache_hit_tokens
+    // 4. Gemini: cached_content_token_count
+    let cache_read = 0;
+    if (typeof apiUsage.prompt_tokens_details?.cached_tokens === 'number') {
+        cache_read = apiUsage.prompt_tokens_details.cached_tokens;
+    } else if (typeof apiUsage.cached_tokens === 'number') {
+        cache_read = apiUsage.cached_tokens;
+    } else if (typeof apiUsage.cache_read_input_tokens === 'number') {
+        cache_read = apiUsage.cache_read_input_tokens;
+    } else if (typeof apiUsage.prompt_cache_hit_tokens === 'number') {
+        cache_read = apiUsage.prompt_cache_hit_tokens;
+    } else if (typeof apiUsage.cached_content_token_count === 'number') {
+        cache_read = apiUsage.cached_content_token_count;
+    }
+
+    // In OpenAI/DeepSeek/Gemini, prompt_tokens includes cached_tokens.
+    // Anthropic input_tokens does NOT include cache_read_input_tokens.
+    const isAnthropicStyle = typeof apiUsage.input_tokens === 'number' && typeof apiUsage.cache_read_input_tokens === 'number';
+    let netInput = input;
+    if (!isAnthropicStyle && cache_read > 0) {
+        netInput = Math.max(0, input - cache_read);
+    }
+
+    if (typeof total !== 'number' || !Number.isFinite(total)) {
+        total = netInput + cache_read + output;
     }
 
     const rawCost = apiUsage.cost ?? apiUsage.cost_details?.upstream_inference_cost;
     const parsedCost = rawCost === null || rawCost === undefined || rawCost === '' ? null : Number(rawCost);
     const cost = Number.isFinite(parsedCost) && parsedCost >= 0 ? parsedCost : null;
 
-    return { input, output, total, cost, source: 'api_usage', hasTokenCounts: true };
+    return {
+        input: netInput,
+        cache_read,
+        output,
+        total,
+        rawPromptTokens: input,
+        cost,
+        source: 'api_usage',
+        hasTokenCounts: true,
+        hasCacheTokens: cache_read > 0,
+    };
 }
 
 /**
@@ -364,13 +429,132 @@ function parseApiUsage(apiUsage) {
  * @returns {Object} Zeroed usage
  */
 function getChatUsage() {
-    return { input: 0, output: 0, total: 0, messageCount: 0 };
+    return { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 };
 }
 
+/** Cache state per chat to track KV cache prefix: chatId -> { prompt: Array|string, timestamp: number } */
+const chatPromptCache = new Map();
+
+/**
+ * Compare two messages for prompt cache prefix matching
+ */
+function isMessageEqual(m1, m2) {
+    if (!m1 || !m2) return false;
+    if (m1.role !== m2.role) return false;
+    if (typeof m1.content === 'string' && typeof m2.content === 'string') {
+        return m1.content === m2.content;
+    }
+    try {
+        return JSON.stringify(m1.content) === JSON.stringify(m2.content);
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
+ * Calculate token count for a single message object
+ */
+async function countMessageTokens(message) {
+    if (!message) return 0;
+    let tokens = 0;
+    if (message.content) {
+        if (typeof message.content === 'string') {
+            tokens += await countTokens(message.content);
+        } else if (Array.isArray(message.content)) {
+            for (const part of message.content) {
+                if (part.type === 'text' && part.text) {
+                    tokens += await countTokens(part.text);
+                } else if (part.type === 'image_url' || part.type === 'image') {
+                    tokens += 765;
+                }
+            }
+        }
+    }
+    if (message.role) tokens += 1;
+    if (message.name) tokens += await countTokens(message.name);
+    if (Array.isArray(message.tool_calls)) {
+        for (const tc of message.tool_calls) {
+            if (tc.function?.name) tokens += await countTokens(tc.function.name);
+            if (tc.function?.arguments) tokens += await countTokens(tc.function.arguments);
+        }
+    }
+    tokens += 3; // per-message envelope overhead
+    return tokens;
+}
+
+/**
+ * Infer cache tokens from previous prompt for this chat.
+ * @param {object} generate_data - generation data containing the full prompt
+ * @param {string} chatId - chat ID or identifier
+ * @returns {Promise<number>} - simulated cached tokens
+ */
+async function inferPromptCacheTokens(generate_data, chatId) {
+    const settings = getSettings();
+    const simCfg = settings.cacheSimulation || {};
+    if (simCfg.enabled === false) return 0;
+
+    const minThreshold = simCfg.minThreshold ?? 1024;
+    const ttlMinutes = simCfg.ttlMinutes ?? 10;
+    const ttlMs = ttlMinutes > 0 ? ttlMinutes * 60 * 1000 : 0;
+
+    const lastState = chatPromptCache.get(chatId);
+    if (!lastState || !lastState.prompt) return 0;
+
+    if (ttlMs > 0 && (Date.now() - lastState.timestamp) > ttlMs) {
+        console.log(`[Token Usage Tracker] Cache simulation: TTL expired (${Math.round((Date.now() - lastState.timestamp) / 60000)}m > ${ttlMinutes}m)`);
+        return 0;
+    }
+
+    const currentPrompt = generate_data.prompt;
+    const lastPrompt = lastState.prompt;
+    let simulatedCacheTokens = 0;
+
+    if (Array.isArray(currentPrompt) && Array.isArray(lastPrompt)) {
+        let matchingCount = 0;
+        const maxLen = Math.min(currentPrompt.length, lastPrompt.length);
+        for (let i = 0; i < maxLen; i++) {
+            if (isMessageEqual(currentPrompt[i], lastPrompt[i])) {
+                matchingCount++;
+            } else {
+                break;
+            }
+        }
+
+        if (matchingCount > 0) {
+            for (let i = 0; i < matchingCount; i++) {
+                simulatedCacheTokens += await countMessageTokens(currentPrompt[i]);
+            }
+            console.log(`[Token Usage Tracker] Cache simulation: matched ${matchingCount}/${currentPrompt.length} messages (${simulatedCacheTokens} tokens)`);
+        }
+    } else if (typeof currentPrompt === 'string' && typeof lastPrompt === 'string') {
+        let commonLen = 0;
+        const maxLen = Math.min(currentPrompt.length, lastPrompt.length);
+        while (commonLen < maxLen && currentPrompt.charCodeAt(commonLen) === lastPrompt.charCodeAt(commonLen)) {
+            commonLen++;
+        }
+        if (commonLen > 0) {
+            const prefixStr = currentPrompt.slice(0, commonLen);
+            simulatedCacheTokens = await countTokens(prefixStr);
+            console.log(`[Token Usage Tracker] Cache simulation: matched prefix string (${simulatedCacheTokens} tokens)`);
+        }
+    }
+
+    if (simulatedCacheTokens < minThreshold) {
+        if (simulatedCacheTokens > 0) {
+            console.log(`[Token Usage Tracker] Cache simulation: ${simulatedCacheTokens} tokens below minThreshold (${minThreshold}), treated as 0`);
+        }
+        return 0;
+    }
+
+    return simulatedCacheTokens;
+}
 
 /** @type {Promise<number>|null} Promise that resolves to input token count - started early, awaited later */
 let pendingInputTokensPromise = null;
+let pendingSimulatedCachePromise = null;
 let pendingModelId = null;
+let pendingChatId = null;
+let pendingGeneratePrompt = null;
 // For 'continue' type generations, track the pre-continue token count so we can compute the delta
 let preContinueTokenCount = 0;
 
@@ -471,6 +655,10 @@ function handleGenerateAfterData(generate_data, dryRun) {
     // Capture model ID synchronously (fast)
     pendingModelId = getGeneratingModel();
 
+    const context = getContext();
+    pendingChatId = context.chatMetadata?.chat_id || (context.characterId !== undefined ? String(context.characterId) : 'default');
+    pendingGeneratePrompt = generate_data.prompt;
+
     // Start token counting but DON'T await - let it run in parallel with the API request
     pendingInputTokensPromise = countInputTokens(generate_data)
         .then(count => {
@@ -479,6 +667,13 @@ function handleGenerateAfterData(generate_data, dryRun) {
         })
         .catch(error => {
             console.error('[Token Usage Tracker] Error counting input tokens:', error);
+            return 0;
+        });
+
+    // Start cache simulation in parallel
+    pendingSimulatedCachePromise = inferPromptCacheTokens(generate_data, pendingChatId)
+        .catch(error => {
+            console.error('[Token Usage Tracker] Error inferring cache tokens:', error);
             return 0;
         });
 }
@@ -563,11 +758,24 @@ async function handleMessageReceived(messageIndex, type) {
         const apiUsage = parseApiUsage(message.extra?.api_usage);
         let inputTokens;
         let outputTokens;
+        let cacheReadTokens = 0;
+
+        const simulatedCacheTokens = pendingSimulatedCachePromise ? (await pendingSimulatedCachePromise) : 0;
 
         if (apiUsage) {
-            inputTokens = apiUsage.input;
             outputTokens = apiUsage.output;
-            console.log(`[Token Usage Tracker] Using API-reported usage: ${inputTokens} in, ${outputTokens} out${apiUsage.cost !== null ? `, $${apiUsage.cost.toFixed(6)}` : ''}`);
+            if (apiUsage.hasCacheTokens) {
+                // API returned native cache tokens
+                cacheReadTokens = apiUsage.cache_read;
+                inputTokens = apiUsage.input;
+                console.log(`[Token Usage Tracker] Using API-reported usage: ${inputTokens} in, ${cacheReadTokens} cache_read, ${outputTokens} out${apiUsage.cost !== null ? `, $${apiUsage.cost.toFixed(6)}` : ''}`);
+            } else {
+                // API reported usage without cache breakdown (e.g. proxy site omitting cached_tokens)
+                const rawPrompt = apiUsage.rawPromptTokens ?? apiUsage.input;
+                cacheReadTokens = Math.min(simulatedCacheTokens, rawPrompt);
+                inputTokens = Math.max(0, rawPrompt - cacheReadTokens);
+                console.log(`[Token Usage Tracker] Using API-reported tokens with simulated cache: ${inputTokens} net in, ${cacheReadTokens} cache_read (from ${rawPrompt} prompt tokens), ${outputTokens} out`);
+            }
         } else {
             // Use SillyTavern's pre-calculated token count if available.
             // This already includes reasoning tokens when power_user.message_token_count_enabled is true.
@@ -586,6 +794,11 @@ async function handleMessageReceived(messageIndex, type) {
                 }
                 console.log(`[Token Usage Tracker] Manually counted tokens: ${outputTokens}`);
             }
+
+            const totalIn = await pendingInputTokensPromise;
+            cacheReadTokens = Math.min(simulatedCacheTokens, totalIn);
+            inputTokens = Math.max(0, totalIn - cacheReadTokens);
+            console.log(`[Token Usage Tracker] Using local tokenizer with simulated cache: ${inputTokens} net in, ${cacheReadTokens} cache_read (from ${totalIn} total in), ${outputTokens} out`);
         }
 
         // For local-tokenizer continue records, subtract the pre-continue count.
@@ -600,23 +813,39 @@ async function handleMessageReceived(messageIndex, type) {
         const savedPreContinueCount = preContinueTokenCount;
         preContinueTokenCount = 0;
 
-        // Await the fallback input token count only when the API did not report it.
-        if (inputTokens === undefined) {
-            inputTokens = await pendingInputTokensPromise;
-        } else {
-            // Drain the pending promise so any tokenizer error handling has completed.
-            pendingInputTokensPromise.catch(() => {});
-        }
+        // Drain pending promises so any tokenizer error handling has completed.
+        if (pendingInputTokensPromise) pendingInputTokensPromise.catch(() => {});
+        if (pendingSimulatedCachePromise) pendingSimulatedCachePromise.catch(() => {});
+
         const modelId = pendingModelId;
+        const currentChatId = pendingChatId || context.chatMetadata?.chat_id || (context.characterId !== undefined ? String(context.characterId) : null);
+
+        // Update chatPromptCache for next turn
+        if (currentChatId && pendingGeneratePrompt) {
+            let nextCachedPrompt;
+            if (Array.isArray(pendingGeneratePrompt)) {
+                nextCachedPrompt = [
+                    ...pendingGeneratePrompt,
+                    { role: 'assistant', content: message.mes || '' },
+                ];
+            } else if (typeof pendingGeneratePrompt === 'string') {
+                nextCachedPrompt = pendingGeneratePrompt + '\n' + (message.mes || '');
+            }
+            chatPromptCache.set(currentChatId, {
+                prompt: nextCachedPrompt,
+                timestamp: Date.now(),
+            });
+        }
+
         pendingInputTokensPromise = null;
+        pendingSimulatedCachePromise = null;
         pendingModelId = null;
+        pendingChatId = null;
+        pendingGeneratePrompt = null;
 
-        // Get current chat ID if available
-        const chatId = context.chatMetadata?.chat_id || null;
+        recordUsage(inputTokens, outputTokens, currentChatId, modelId, apiUsage, cacheReadTokens);
 
-        recordUsage(inputTokens, outputTokens, chatId, modelId, apiUsage);
-
-        console.log(`[Token Usage Tracker] Recorded exchange: ${inputTokens} in, ${outputTokens} out, model: ${modelId || 'unknown'}${savedPreContinueCount > 0 ? ' (continue delta)' : ''}`);
+        console.log(`[Token Usage Tracker] Recorded exchange: ${inputTokens} in, ${cacheReadTokens} cache_read, ${outputTokens} out, model: ${modelId || 'unknown'}${savedPreContinueCount > 0 ? ' (continue delta)' : ''}`);
     } catch (error) {
         console.error('[Token Usage Tracker] Error counting output tokens:', error);
     }
@@ -652,23 +881,31 @@ async function handleGenerationStopped() {
 
         // Await the input token counting that was started in handleGenerateAfterData
         const inputTokens = await pendingInputTokensPromise;
+        const simulatedCacheTokens = pendingSimulatedCachePromise ? (await pendingSimulatedCachePromise) : 0;
+        const cacheReadTokens = Math.min(simulatedCacheTokens, inputTokens);
+        const netInput = Math.max(0, inputTokens - cacheReadTokens);
         const modelId = pendingModelId;
+        const currentChatId = pendingChatId || null;
+
         pendingInputTokensPromise = null;
+        pendingSimulatedCachePromise = null;
         pendingModelId = null;
+        pendingChatId = null;
+        pendingGeneratePrompt = null;
         preContinueTokenCount = 0; // Reset continue state too
 
-        // Get current chat ID if available
-        const context = getContext();
-        const chatId = context.chatMetadata?.chat_id || null;
-
         // Record the usage - input tokens were sent even if generation was stopped
-        recordUsage(inputTokens, outputTokens, chatId, modelId);
+        recordUsage(netInput, outputTokens, currentChatId, modelId, {}, cacheReadTokens);
 
-        console.log(`[Token Usage Tracker] Recorded stopped generation: ${inputTokens} in, ${outputTokens} out (partial), model: ${modelId || 'unknown'}`);
+        console.log(`[Token Usage Tracker] Recorded stopped generation: ${netInput} in, ${cacheReadTokens} cache_read, ${outputTokens} out (partial), model: ${modelId || 'unknown'}`);
     } catch (error) {
         console.error('[Token Usage Tracker] Error handling stopped generation:', error);
         // Reset pending tokens even on error to prevent double counting
         pendingInputTokensPromise = null;
+        pendingSimulatedCachePromise = null;
+        pendingModelId = null;
+        pendingChatId = null;
+        pendingGeneratePrompt = null;
         preContinueTokenCount = 0;
     }
 }
@@ -679,12 +916,14 @@ async function handleGenerationStopped() {
 function handleChatChanged(chatId) {
     // Reset pending tokens when chat changes to prevent cross-chat counting
     pendingInputTokensPromise = null;
+    pendingSimulatedCachePromise = null;
     pendingModelId = null;
+    pendingChatId = null;
+    pendingGeneratePrompt = null;
     preContinueTokenCount = 0;
     isQuietGeneration = false;
     isImpersonateGeneration = false;
     console.log(`[Token Usage Tracker] Chat changed to: ${chatId}`);
-    eventSource.emit('tokenUsageUpdated', getUsageStats());
 }
 
 /**
@@ -1334,15 +1573,19 @@ function setModelPrice(modelId, priceIn, priceOut) {
  * @param {string} modelId
  * @returns {number} Cost in dollars
  */
-function calculateCost(inputTokens, outputTokens, modelId) {
-    if ((inputTokens || 0) <= 0 && (outputTokens || 0) <= 0) return 0;
+function calculateCost(inputTokens, outputTokens, modelId, cacheReadTokens = 0) {
+    if ((inputTokens || 0) <= 0 && (outputTokens || 0) <= 0 && (cacheReadTokens || 0) <= 0) return 0;
 
     const prices = resolveModelPrice(modelId);
     if (!prices.resolved || prices.in === null || prices.out === null) return 0;
 
+    // Cache price: default to 10% of input price if not specified
+    const cachePrice = prices.cache != null ? prices.cache : (prices.in * 0.1);
+
     const inputCost = (inputTokens / 1000000) * prices.in;
+    const cacheCost = (cacheReadTokens / 1000000) * cachePrice;
     const outputCost = (outputTokens / 1000000) * prices.out;
-    return inputCost + outputCost;
+    return inputCost + cacheCost + outputCost;
 }
 
 function calculateStoredOrEstimatedCost(data, modelId) {
@@ -1351,7 +1594,8 @@ function calculateStoredOrEstimatedCost(data, modelId) {
     const exactCost = Number.isFinite(data.cost) ? data.cost : 0;
     const residualInput = Math.max(0, (data.input || 0) - (data.costedInput || 0));
     const residualOutput = Math.max(0, (data.output || 0) - (data.costedOutput || 0));
-    return exactCost + calculateCost(residualInput, residualOutput, modelId);
+    const residualCache = Math.max(0, data.cache_read || 0);
+    return exactCost + calculateCost(residualInput, residualOutput, modelId, residualCache);
 }
 
 function formatCost(cost) {
@@ -1370,13 +1614,15 @@ function formatPricePerMillion(price) {    const value = Number(price);
     return `$${value.toFixed(4).replace(/\.?0+$/, '')}/1M`;
 }
 
-function renderInputOutputRows(prefix, input, output, requests, valueFontSize = '14px') {
+function renderInputOutputRows(prefix, input, output, requests, cacheRead = 0, valueFontSize = '13px') {
     return `
-        <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px 10px; color: var(--SmartThemeBodyColor);">
+        <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px 6px; color: var(--SmartThemeBodyColor);">
             <div style="font-size: 10px; opacity: 0.75;">In</div>
+            <div style="font-size: 10px; opacity: 0.75;" title="Prompt Cache Tokens">Cache</div>
             <div style="font-size: 10px; opacity: 0.75;">Out</div>
             <div style="font-size: 10px; opacity: 0.75;">Requests</div>
             <div id="token-usage-${prefix}-in" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(input || 0)}</div>
+            <div id="token-usage-${prefix}-cache" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor); opacity: 0.85;">${formatNumberFull(cacheRead || 0)}</div>
             <div id="token-usage-${prefix}-out" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(output || 0)}</div>
             <div id="token-usage-${prefix}-requests" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(requests || 0)}</div>
         </div>
@@ -1388,7 +1634,7 @@ function renderUsageStatCard(title, prefix, data, cost = '$0.00') {
         <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); overflow: hidden; display: flex;">
             <div style="flex: 1; padding: 6px 8px;">
                 <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5; margin-bottom: 4px;">${title}</div>
-                ${renderInputOutputRows(prefix, data.input, data.output, data.messageCount)}
+                ${renderInputOutputRows(prefix, data.input, data.output, data.messageCount, data.cache_read || 0)}
             </div>
             <div style="width: 1px; background: var(--SmartThemeBorderColor);"></div>
             <div style="flex: 0 0 78px; padding: 6px 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;">
@@ -1456,6 +1702,7 @@ function getChartData(days) {
             dayKey: dayKey,
             usage: dayData.total || 0,
             input: dayData.input || 0,
+            cache_read: dayData.cache_read || 0,
             output: dayData.output || 0,
             messageCount: dayData.messageCount || 0,
             models: dayData.models || {},
@@ -1692,14 +1939,15 @@ function showTooltip(d) {
     if (d.models && Object.keys(d.models).length > 0) {
         const getModelTokenBreakdown = (value) => {
             if (typeof value === 'number') {
-                return { total: value, input: null, output: null, messageCount: null };
+                return { total: value, input: null, cache_read: null, output: null, messageCount: null };
             }
 
             const input = Number(value?.input) || 0;
+            const cache_read = Number(value?.cache_read) || 0;
             const output = Number(value?.output) || 0;
-            const total = Number(value?.total) || (input + output);
+            const total = Number(value?.total) || (input + cache_read + output);
             const messageCount = Number(value?.messageCount);
-            return { total, input, output, messageCount: Number.isFinite(messageCount) ? messageCount : null };
+            return { total, input, cache_read, output, messageCount: Number.isFinite(messageCount) ? messageCount : null };
         };
 
         const modelEntries = Object.entries(d.models).sort((a, b) => getModelTokenBreakdown(a[1]).total - getModelTokenBreakdown(b[1]).total); // Sort ascending (smallest first, like graph bottom-up)
@@ -1710,14 +1958,14 @@ function showTooltip(d) {
             modelBreakdown += `<div style="font-size: 9px; color: rgba(255,255,255,0.3); margin-bottom: 2px;">+${hiddenEntryCount} more</div>`;
         }
         for (const [model, modelData] of displayEntries) {
-            const { total, input, output, messageCount } = getModelTokenBreakdown(modelData);
+            const { total, input, cache_read, output, messageCount } = getModelTokenBreakdown(modelData);
             const percent = d.usage > 0 ? Math.round((total / d.usage) * 100) : 0;
             const shortName = model.length > 25 ? model.substring(0, 22) + '...' : model;
             const color = getModelColor(model);
             const breakdownLines = input !== null && output !== null
                 ? `
                     <div style="margin-top: 0; margin-left: 12px; color: rgba(255,255,255,0.65); line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
-                        ${formatNumberFull(input)} | ${formatNumberFull(output)}${messageCount !== null ? ` | ${formatNumberFull(messageCount)}` : ''}
+                        ${formatNumberFull(input)} in${cache_read ? ` | ${formatNumberFull(cache_read)} cache` : ''} | ${formatNumberFull(output)} out${messageCount !== null ? ` | ${formatNumberFull(messageCount)}` : ''}
                     </div>
                 `
                 : `
@@ -1743,11 +1991,13 @@ function showTooltip(d) {
     tooltip.innerHTML = `
         <div style="font-weight: 600; margin-bottom: 2px; color: var(--SmartThemeBodyColor);">${d.fullDate}</div>
         <div style="font-size: 12px; font-weight: 600; color: var(--SmartThemeBodyColor); margin-bottom: 4px;">${formatCost(tooltipCost)}</div>
-        <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px 10px; font-size: 10px; color: var(--SmartThemeBodyColor); margin-bottom: 2px;">
+        <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px 6px; font-size: 10px; color: var(--SmartThemeBodyColor); margin-bottom: 2px;">
             <div style="opacity: 0.6;">In</div>
+            <div style="opacity: 0.6;" title="Prompt Cache Tokens">Cache</div>
             <div style="opacity: 0.6;">Out</div>
             <div style="opacity: 0.6;">Requests</div>
             <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.input)}</div>
+            <div style="font-size: 11px; font-weight: 600; opacity: 0.85;">${formatNumberFull(d.cache_read || 0)}</div>
             <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.output)}</div>
             <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.messageCount)}</div>
         </div>
@@ -1815,17 +2065,21 @@ function updateUIStats() {
 
     // Today stats
     $('#token-usage-today-in').text(formatNumberFull(stats.today.input || 0));
+    $('#token-usage-today-cache').text(formatNumberFull(stats.today.cache_read || 0));
     $('#token-usage-today-out').text(formatNumberFull(stats.today.output || 0));
     $('#token-usage-today-requests').text(formatNumberFull(stats.today.messageCount || 0));
 
     // Stats grid
     $('#token-usage-week-in').text(formatNumberFull(stats.thisWeek.input || 0));
+    $('#token-usage-week-cache').text(formatNumberFull(stats.thisWeek.cache_read || 0));
     $('#token-usage-week-out').text(formatNumberFull(stats.thisWeek.output || 0));
     $('#token-usage-week-requests').text(formatNumberFull(stats.thisWeek.messageCount || 0));
     $('#token-usage-month-in').text(formatNumberFull(stats.thisMonth.input || 0));
+    $('#token-usage-month-cache').text(formatNumberFull(stats.thisMonth.cache_read || 0));
     $('#token-usage-month-out').text(formatNumberFull(stats.thisMonth.output || 0));
     $('#token-usage-month-requests').text(formatNumberFull(stats.thisMonth.messageCount || 0));
     $('#token-usage-alltime-in').text(formatNumberFull(stats.allTime.input || 0));
+    $('#token-usage-alltime-cache').text(formatNumberFull(stats.allTime.cache_read || 0));
     $('#token-usage-alltime-out').text(formatNumberFull(stats.allTime.output || 0));
     $('#token-usage-alltime-requests').text(formatNumberFull(stats.allTime.messageCount || 0));
 
@@ -2010,6 +2264,30 @@ function createSettingsUI() {
                         </div>
                     </div>
 
+                    <!-- Prompt Cache Simulation -->
+                    <div class="inline-drawer" style="margin-top: 6px;">
+                        <div class="inline-drawer-toggle inline-drawer-header" style="padding: 4px 0 4px 8px;">
+                            <span style="font-size: 11px;">Prompt Cache Simulation</span>
+                            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                        </div>
+                        <div class="inline-drawer-content" style="padding: 6px 8px; font-size: 11px;">
+                            <label style="display: flex; align-items: center; gap: 6px; margin-bottom: 6px; cursor: pointer;">
+                                <input type="checkbox" id="token-usage-cache-sim-enabled">
+                                <span>Infer Cache (when proxy omits cached tokens)</span>
+                            </label>
+                            <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+                                <label style="display: flex; align-items: center; gap: 4px;">
+                                    <span style="opacity: 0.7;">Min Tokens:</span>
+                                    <input type="number" id="token-usage-cache-min-tokens" min="0" step="64" style="width: 55px; padding: 2px 4px; font-size: 10px; border-radius: 3px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor);">
+                                </label>
+                                <label style="display: flex; align-items: center; gap: 4px;">
+                                    <span style="opacity: 0.7;">TTL (min):</span>
+                                    <input type="number" id="token-usage-cache-ttl-min" min="0" step="1" style="width: 45px; padding: 2px 4px; font-size: 10px; border-radius: 3px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor);">
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Controls -->
                     <div style="display: flex; align-items: center; gap: 8px; padding-left: 8px;">
                         <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;" id="token-usage-tokenizer">Tokenizer: ${stats.tokenizer || 'Unknown'}</div>
@@ -2037,6 +2315,26 @@ function createSettingsUI() {
             console.log('[Token Usage Tracker] UI appended to extensions_settings (fallback)');
         }
     }
+
+    // Initialize Prompt Cache settings inputs
+    const settings = getSettings();
+    if (!settings.cacheSimulation) settings.cacheSimulation = structuredClone(defaultSettings.cacheSimulation);
+    $('#token-usage-cache-sim-enabled').prop('checked', settings.cacheSimulation.enabled !== false);
+    $('#token-usage-cache-min-tokens').val(settings.cacheSimulation.minThreshold ?? 1024);
+    $('#token-usage-cache-ttl-min').val(settings.cacheSimulation.ttlMinutes ?? 10);
+
+    $('#token-usage-cache-sim-enabled').on('change', function () {
+        settings.cacheSimulation.enabled = $(this).is(':checked');
+        saveSettings();
+    });
+    $('#token-usage-cache-min-tokens').on('input', function () {
+        settings.cacheSimulation.minThreshold = Math.max(0, parseInt($(this).val(), 10) || 0);
+        saveSettings();
+    });
+    $('#token-usage-cache-ttl-min').on('input', function () {
+        settings.cacheSimulation.ttlMinutes = Math.max(0, parseInt($(this).val(), 10) || 0);
+        saveSettings();
+    });
 
     // Create tooltip element and append to body (not inside extension container to avoid layout issues)
     if (!document.getElementById('token-usage-tooltip')) {

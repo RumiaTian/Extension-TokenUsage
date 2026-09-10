@@ -34,8 +34,8 @@ const V2 = 2;
 
 export function createEmptyRuntime() {
     return {
-        session: { input: 0, output: 0, total: 0, messageCount: 0, startTime: null },
-        allTime: { input: 0, output: 0, total: 0, messageCount: 0 },
+        session: { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0, startTime: null },
+        allTime: { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 },
         byDay: {},
         byModel: {},
     };
@@ -45,12 +45,13 @@ function bucketHasCost(bucket) {
     return Number.isFinite(bucket.cost);
 }
 
-/** Deserialize one [modelIdx, in, out, msgCount, cost?, ci?, co?] row */
+/** Deserialize one [modelIdx, in, out, msgCount, cost?, ci?, co?, cr?] row */
 function rowToBucket(row) {
     const bucket = {
         input: row[1] || 0,
         output: row[2] || 0,
-        total: (row[1] || 0) + (row[2] || 0),
+        cache_read: row[7] || 0,
+        total: (row[1] || 0) + (row[2] || 0) + (row[7] || 0),
         messageCount: row[3] || 0,
     };
     if (Number.isFinite(row[4])) {
@@ -61,11 +62,18 @@ function rowToBucket(row) {
     return bucket;
 }
 
-/** Serialize a runtime bucket to [idx, in, out, msgCount, cost?, ci?, co?] */
+/** Serialize a runtime bucket to [idx, in, out, msgCount, cost?, ci?, co?, cr?] */
 function bucketToRow(idx, bucket) {
     const row = [idx, bucket.input || 0, bucket.output || 0, bucket.messageCount || 0];
-    if (bucketHasCost(bucket)) {
-        row.push(bucket.cost, bucket.costedInput || 0, bucket.costedOutput || 0);
+    const hasCost = bucketHasCost(bucket);
+    const hasCache = (bucket.cache_read || 0) > 0;
+    if (hasCost || hasCache) {
+        row.push(
+            hasCost ? bucket.cost : null,
+            hasCost ? (bucket.costedInput || 0) : null,
+            hasCost ? (bucket.costedOutput || 0) : null,
+            bucket.cache_read || 0
+        );
     }
     return row;
 }
@@ -91,7 +99,8 @@ export function deserializeUsage(compact) {
         const dayData = {
             input: day.i || 0,
             output: day.o || 0,
-            total: (day.i || 0) + (day.o || 0),
+            cache_read: day.cr || 0,
+            total: (day.i || 0) + (day.o || 0) + (day.cr || 0),
             messageCount: day.n || 0,
             models: {},
         };
@@ -146,6 +155,9 @@ export function serializeUsage(runtime) {
             o: day.output || 0,
             n: day.messageCount || 0,
         };
+        if ((day.cache_read || 0) > 0) {
+            compact.cr = day.cache_read;
+        }
         if (bucketHasCost(day)) {
             compact.c = day.cost;
             compact.ci = day.costedInput || 0;
@@ -251,17 +263,19 @@ function csvEscape(value) {
  */
 export function buildUsageCsv(runtime, costFn) {
     const byDay = (runtime && runtime.byDay) || {};
-    const lines = ['date,model,input_tokens,output_tokens,total_tokens,requests,cost_usd'];
+    const lines = ['date,model,input_tokens,cache_tokens,output_tokens,total_tokens,requests,cost_usd'];
 
     for (const dayKey of Object.keys(byDay).sort()) {
         const day = byDay[dayKey];
         const modelEntries = Object.entries(day.models || {}).sort(([a], [b]) => a.localeCompare(b));
 
         let modelInput = 0;
+        let modelCache = 0;
         let modelOutput = 0;
         let modelRequests = 0;
         for (const [modelId, modelData] of modelEntries) {
             modelInput += modelData.input || 0;
+            modelCache += modelData.cache_read || 0;
             modelOutput += modelData.output || 0;
             modelRequests += modelData.messageCount || 0;
             const cost = Number((costFn ? costFn(modelData, modelId) : 0).toFixed(6));
@@ -269,8 +283,9 @@ export function buildUsageCsv(runtime, costFn) {
                 dayKey,
                 csvEscape(modelId),
                 modelData.input || 0,
+                modelData.cache_read || 0,
                 modelData.output || 0,
-                modelData.total != null ? modelData.total : (modelData.input || 0) + (modelData.output || 0),
+                modelData.total != null ? modelData.total : (modelData.input || 0) + (modelData.output || 0) + (modelData.cache_read || 0),
                 modelData.messageCount || 0,
                 cost,
             ].join(','));
@@ -279,16 +294,18 @@ export function buildUsageCsv(runtime, costFn) {
         // Background/quiet generations are recorded without a model ID and only
         // roll into the day totals — surface the remainder as an unattributed row.
         const unattributedInput = (day.input || 0) - modelInput;
+        const unattributedCache = (day.cache_read || 0) - modelCache;
         const unattributedOutput = (day.output || 0) - modelOutput;
         const unattributedRequests = (day.messageCount || 0) - modelRequests;
-        if (unattributedInput > 0 || unattributedOutput > 0 || unattributedRequests > 0) {
+        if (unattributedInput > 0 || unattributedCache > 0 || unattributedOutput > 0 || unattributedRequests > 0) {
             const cost = Number((costFn ? costFn(day, null) : 0).toFixed(6));
             lines.push([
                 dayKey,
                 '(unattributed)',
                 unattributedInput,
+                unattributedCache,
                 unattributedOutput,
-                unattributedInput + unattributedOutput,
+                unattributedInput + unattributedOutput + unattributedCache,
                 unattributedRequests,
                 cost,
             ].join(','));
