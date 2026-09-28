@@ -42,17 +42,14 @@
   z-index: 2;
 }
 
-/* Adaptive layout for the week/month/all-time stat cards */
+/* Layout for the week/month/all-time stat cards */
 .token-usage-stats-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
 }
 
 .token-usage-stat-card {
   min-width: 0;
-}
-
-@media (max-width: 560px) {
-  .token-usage-stats-grid {
-    grid-template-columns: 1fr;
-  }
+  box-sizing: border-box;
 }

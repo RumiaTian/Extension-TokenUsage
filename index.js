@@ -1062,15 +1062,30 @@ function formatNumberFull(num) {
 }
 
 /**
- * Adaptive formatting for dense card columns (abbreviate only when >= 10M)
+ * Adaptive formatting for dense card columns (k/M compact notation)
  */
 function formatNumberAdaptive(num) {
     if (typeof num !== 'number' || !Number.isFinite(num)) return '0';
-    if (num >= 10000000) {
-        return (num / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
+    const isNeg = num < 0;
+    const abs = Math.abs(num);
+    let str = '0';
+    if (abs === 0) {
+        str = '0';
+    } else if (abs < 1000) {
+        str = abs.toString();
+    } else if (abs < 10000) {
+        str = abs.toLocaleString('en-US');
+    } else if (abs < 1000000) {
+        const k = abs / 1000;
+        str = (k >= 100 ? k.toFixed(0) : k.toFixed(1)) + 'k';
+    } else if (abs < 10000000) {
+        str = (abs / 1000000).toFixed(2) + 'M';
+    } else {
+        str = (abs / 1000000).toFixed(1) + 'M';
     }
-    return new Intl.NumberFormat('en-US').format(num);
+    return isNeg ? '-' + str : str;
 }
+
 
 /**
  * Normalize model IDs for compatibility matching.
@@ -1670,7 +1685,8 @@ function formatPricePerMillion(price) {    const value = Number(price);
     return `$${value.toFixed(4).replace(/\.?0+$/, '')}/1M`;
 }
 
-function renderInputOutputRows(prefix, data, isCacheActive, valueFontSize = '12px') {
+function renderInputOutputRows(prefix, data, isCacheActive) {
+    data = data || {};
     const input = data.input || 0;
     const cache = data.cache_read || 0;
     const output = data.output || 0;
@@ -1680,56 +1696,76 @@ function renderInputOutputRows(prefix, data, isCacheActive, valueFontSize = '12p
 
     if (isCacheActive) {
         return `
-            <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px 4px; color: var(--SmartThemeBodyColor);">
-                <div style="font-size: 10px; opacity: 0.75;" title="非缓存输入 Token (Net Input)">In</div>
-                <div style="font-size: 10px; opacity: 0.75; color: #60a5fa;" title="命中的提示词缓存 Token (Prompt Cache)">Cache</div>
-                <div style="font-size: 10px; opacity: 0.75;" title="模型生成输出 Token (Output)">Out</div>
-                <div style="font-size: 10px; opacity: 0.75;" title="请求次数 (Requests)">Reqs</div>
-                <div id="token-usage-${prefix}-in" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${formatNumberFull(displayIn)}">${formatNumberAdaptive(displayIn)}</div>
-                <div id="token-usage-${prefix}-cache" style="font-size: ${valueFontSize}; font-weight: 600; color: #60a5fa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${formatNumberFull(cache)}">${formatNumberAdaptive(cache)}</div>
-                <div id="token-usage-${prefix}-out" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${formatNumberFull(output)}">${formatNumberAdaptive(output)}</div>
-                <div id="token-usage-${prefix}-requests" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${formatNumberFull(requests)}">${formatNumberFull(requests)}</div>
+            <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; background: rgba(0, 0, 0, 0.22); border-radius: 5px; padding: 5px 4px; text-align: center; border: 1px solid rgba(255, 255, 255, 0.04);">
+                <div style="min-width: 0;">
+                    <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.6; line-height: 1.2; margin-bottom: 2px;" title="非缓存输入 Token (Net Input)">In</div>
+                    <div id="token-usage-${prefix}-in" style="font-size: 11px; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${formatNumberFull(displayIn)}">${formatNumberAdaptive(displayIn)}</div>
+                </div>
+                <div style="min-width: 0;">
+                    <div style="font-size: 9px; color: #60a5fa; opacity: 0.95; line-height: 1.2; margin-bottom: 2px;" title="命中的提示词缓存 Token (Prompt Cache)">Cache</div>
+                    <div id="token-usage-${prefix}-cache" style="font-size: 11px; font-weight: 600; color: #60a5fa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${formatNumberFull(cache)}">${formatNumberAdaptive(cache)}</div>
+                </div>
+                <div style="min-width: 0;">
+                    <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.6; line-height: 1.2; margin-bottom: 2px;" title="模型生成输出 Token (Output)">Out</div>
+                    <div id="token-usage-${prefix}-out" style="font-size: 11px; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${formatNumberFull(output)}">${formatNumberAdaptive(output)}</div>
+                </div>
+                <div style="min-width: 0;">
+                    <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.6; line-height: 1.2; margin-bottom: 2px;" title="请求次数 (Requests)">Reqs</div>
+                    <div id="token-usage-${prefix}-requests" style="font-size: 11px; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${formatNumberFull(requests)}">${formatNumberAdaptive(requests)}</div>
+                </div>
             </div>
         `;
     } else {
         return `
-            <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px 8px; color: var(--SmartThemeBodyColor);">
-                <div style="font-size: 10px; opacity: 0.75;" title="总输入 Token (Total Input)">In</div>
-                <div style="font-size: 10px; opacity: 0.75;" title="模型生成输出 Token (Output)">Out</div>
-                <div style="font-size: 10px; opacity: 0.75;" title="请求次数 (Requests)">Requests</div>
-                <div id="token-usage-${prefix}-in" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${formatNumberFull(displayIn)}">${formatNumberAdaptive(displayIn)}</div>
-                <div id="token-usage-${prefix}-out" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${formatNumberFull(output)}">${formatNumberAdaptive(output)}</div>
-                <div id="token-usage-${prefix}-requests" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${formatNumberFull(requests)}">${formatNumberFull(requests)}</div>
+            <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; background: rgba(0, 0, 0, 0.22); border-radius: 5px; padding: 5px 8px; text-align: center; border: 1px solid rgba(255, 255, 255, 0.04);">
+                <div style="min-width: 0;">
+                    <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.6; line-height: 1.2; margin-bottom: 2px;" title="总输入 Token (Total Input)">Input</div>
+                    <div id="token-usage-${prefix}-in" style="font-size: 11px; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${formatNumberFull(displayIn)}">${formatNumberAdaptive(displayIn)}</div>
+                </div>
+                <div style="min-width: 0;">
+                    <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.6; line-height: 1.2; margin-bottom: 2px;" title="模型生成输出 Token (Output)">Output</div>
+                    <div id="token-usage-${prefix}-out" style="font-size: 11px; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${formatNumberFull(output)}">${formatNumberAdaptive(output)}</div>
+                </div>
+                <div style="min-width: 0;">
+                    <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.6; line-height: 1.2; margin-bottom: 2px;" title="请求次数 (Requests)">Requests</div>
+                    <div id="token-usage-${prefix}-requests" style="font-size: 11px; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${formatNumberFull(requests)}">${formatNumberAdaptive(requests)}</div>
+                </div>
             </div>
         `;
     }
 }
 
 function renderUsageStatCard(title, prefix, data, cost = '$0.00', isCacheActive = true) {
-    const totalPrompt = (data.input || 0) + (data.cache_read || 0);
-    const hitRate = isCacheActive && totalPrompt > 0 && (data.cache_read || 0) > 0
-        ? Math.round(((data.cache_read || 0) / totalPrompt) * 100)
+    data = data || {};
+    const input = data.input || 0;
+    const cache = data.cache_read || 0;
+    const output = data.output || 0;
+    const requests = data.messageCount || 0;
+    const totalTokens = data.total != null ? data.total : (input + cache + output);
+    const totalPrompt = input + cache;
+
+    const hitRate = isCacheActive && totalPrompt > 0 && cache > 0
+        ? Math.round((cache / totalPrompt) * 100)
         : null;
 
+    const hitRateBadge = (isCacheActive && hitRate !== null)
+        ? `<span style="font-size: 9px; padding: 1px 5px; border-radius: 4px; background: rgba(59, 130, 246, 0.2); color: #60a5fa; font-weight: 600; cursor: help; border: 1px solid rgba(96, 165, 250, 0.35);" title="提示词缓存命中率: ${hitRate}% (命中: ${formatNumberFull(cache)} / 总输入: ${formatNumberFull(totalPrompt)})">${hitRate}% hit</span>`
+        : '';
+
     return `
-        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); overflow: hidden; display: flex;">
-            <div style="flex: 1; padding: 6px 8px; min-width: 0;">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-                    <span style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.6; font-weight: 600;">${title}</span>
-                    ${hitRate !== null ? `
-                        <span style="font-size: 8px; padding: 1px 4px; border-radius: 3px; background: rgba(59, 130, 246, 0.15); color: #60a5fa; font-weight: 600; cursor: help;"
-                              title="提示词缓存命中率: ${hitRate}% (命中: ${formatNumberFull(data.cache_read)} / 总输入: ${formatNumberFull(totalPrompt)})">
-                            ${hitRate}% hit
-                        </span>
-                    ` : ''}
+        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); padding: 7px 10px; box-sizing: border-box;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+                <div style="display: flex; align-items: center; gap: 6px; min-width: 0;">
+                    <span style="font-size: 11px; font-weight: 600; color: var(--SmartThemeBodyColor); letter-spacing: 0.2px;">${title}</span>
+                    ${hitRateBadge}
                 </div>
-                ${renderInputOutputRows(prefix, data, isCacheActive)}
+                <div style="display: flex; align-items: baseline; gap: 5px; flex-shrink: 0;">
+                    <span style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.55;" title="Total: ${formatNumberFull(totalTokens)} tokens">${formatNumberAdaptive(totalTokens)} tok ·</span>
+                    <span style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Cost</span>
+                    <span id="token-usage-${prefix}-cost" style="font-size: 13px; font-weight: 700; color: var(--SmartThemeBodyColor);" title="${cost}">${cost}</span>
+                </div>
             </div>
-            <div style="width: 1px; background: var(--SmartThemeBorderColor);"></div>
-            <div style="flex: 0 0 74px; padding: 6px 6px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;">
-                <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Cost</div>
-                <span style="font-size: 13px; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" id="token-usage-${prefix}-cost" title="${cost}">${cost}</span>
-            </div>
+            ${renderInputOutputRows(prefix, data, isCacheActive)}
         </div>
     `;
 }
@@ -2348,7 +2384,7 @@ function createSettingsUI() {
                     </div>
 
                     <!-- Stats Grid (Today, Week, Month, All Time) -->
-                    <div id="token-usage-stats-grid" class="token-usage-stats-grid" style="display: grid; gap: 6px; margin-bottom: 10px;">
+                    <div id="token-usage-stats-grid" class="token-usage-stats-grid" style="display: grid; grid-template-columns: 1fr; gap: 6px; margin-bottom: 10px;">
                         ${renderUsageStatCard('Today', 'today', stats.today, '$0.00', isCacheActive)}
                         ${renderUsageStatCard('This Week', 'week', stats.thisWeek, '$0.00', isCacheActive)}
                         ${renderUsageStatCard('This Month', 'month', stats.thisMonth, '$0.00', isCacheActive)}
