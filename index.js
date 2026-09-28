@@ -1836,8 +1836,15 @@ function calculateAllTimeCost() {
 
 // Chart state
 let currentChartRange = 30;
+let currentChartView = 'type'; // 'type' | 'model'
 let chartData = [];
 let tooltip = null;
+
+const TOKEN_TYPE_COLORS = {
+    in: '#6366f1',     // Indigo for Net Input
+    cache: '#38bdf8',  // Sky blue / cyan for Prompt Cache
+    out: '#10b981',    // Emerald for Output
+};
 
 // Chart colors - adapted for dark theme
 const CHART_COLORS = {
@@ -2022,42 +2029,65 @@ function renderChart() {
             outerPathD = `M ${barX},${barY + h} v-${h - r} a${r},${r} 0 0 1 ${r},-${r} h${w - 2 * r} a${r},${r} 0 0 1 ${r},${r} v${h - r} z`;
         }
 
-        // Draw filled segments for each model
-        if (d.models && Object.keys(d.models).length > 0 && d.usage > 0) {
-            // Extract total from new object format or use number directly for legacy
-            const getTokens = (v) => typeof v === 'number' ? v : (v.total || 0);
-            const modelEntries = Object.entries(d.models).sort((a, b) => getTokens(b[1]) - getTokens(a[1])); // Sort by usage desc
+        // Draw filled segments
+        if (d.usage > 0) {
+            const segments = [];
+
+            if (currentChartView === 'type') {
+                const settings = getSettings();
+                const isCacheActive = settings.trackCache !== false;
+                const inTokens = isCacheActive ? (d.input || 0) : ((d.input || 0) + (d.cache_read || 0));
+                const cacheTokens = isCacheActive ? (d.cache_read || 0) : 0;
+                const outTokens = d.output || 0;
+
+                // Segments from bottom to top: In, Cache, Out
+                if (inTokens > 0) segments.push({ tokens: inTokens, color: TOKEN_TYPE_COLORS.in, label: 'In' });
+                if (cacheTokens > 0) segments.push({ tokens: cacheTokens, color: TOKEN_TYPE_COLORS.cache, label: 'Cache' });
+                if (outTokens > 0) segments.push({ tokens: outTokens, color: TOKEN_TYPE_COLORS.out, label: 'Out' });
+            } else {
+                // By Model
+                if (d.models && Object.keys(d.models).length > 0) {
+                    const getTokens = (v) => typeof v === 'number' ? v : (v.total || 0);
+                    const modelEntries = Object.entries(d.models).sort((a, b) => getTokens(b[1]) - getTokens(a[1]));
+                    let attributedTotal = 0;
+                    for (const [modelId, modelData] of modelEntries) {
+                        const tokens = getTokens(modelData);
+                        if (tokens > 0) {
+                            segments.push({ tokens, color: getModelColor(modelId), label: modelId });
+                            attributedTotal += tokens;
+                        }
+                    }
+                    if (d.usage > attributedTotal) {
+                        segments.push({ tokens: d.usage - attributedTotal, color: 'rgba(255, 255, 255, 0.25)', label: 'Unattributed' });
+                    }
+                } else {
+                    segments.push({ tokens: d.usage, color: 'rgba(255, 255, 255, 0.25)', label: 'Unattributed' });
+                }
+            }
 
             let cumulativeY = barY + h; // Start from bottom
-
-            for (const [modelId, modelData] of modelEntries) {
-                const tokens = getTokens(modelData);
-                const segmentHeight = (tokens / d.usage) * h;
+            for (let sIdx = 0; sIdx < segments.length; sIdx++) {
+                const seg = segments[sIdx];
+                const segmentHeight = (seg.tokens / d.usage) * h;
                 const segmentY = cumulativeY - segmentHeight;
 
-                // Create path for this segment with rounded corners for top segment
-                let segmentPath;
-                const isBottom = cumulativeY === barY + h;
-                const isTop = segmentY <= barY + 0.01; // Small epsilon for float comparison
+                const isBottom = sIdx === 0;
+                const isTop = sIdx === segments.length - 1;
 
+                let segmentPath;
                 if (segmentHeight < r * 2) {
-                    // Too small for rounded corners
                     segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight} h${w} v${segmentHeight} z`;
                 } else if (isTop && isBottom) {
-                    // Only segment - round top corners
                     segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight - r} a${r},${r} 0 0 1 ${r},-${r} h${w - 2 * r} a${r},${r} 0 0 1 ${r},${r} v${segmentHeight - r} z`;
                 } else if (isTop) {
-                    // Top segment - round top corners only
                     segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight - r} a${r},${r} 0 0 1 ${r},-${r} h${w - 2 * r} a${r},${r} 0 0 1 ${r},${r} v${segmentHeight - r} z`;
                 } else {
-                    // Bottom or middle segment - no rounding
                     segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight} h${w} v${segmentHeight} z`;
                 }
 
-                const color = getModelColor(modelId);
                 const segment = createSVGElement('path', {
                     d: segmentPath,
-                    fill: color,
+                    fill: seg.color,
                     opacity: '1',
                     'shape-rendering': 'geometricPrecision',
                     'pointer-events': 'none',
@@ -2097,6 +2127,89 @@ function renderChart() {
     });
 
     container.appendChild(svg);
+    renderChartLegend();
+}
+
+/**
+ * Render data legend below the chart
+ */
+function renderChartLegend() {
+    const legendEl = document.getElementById('token-usage-chart-legend');
+    if (!legendEl) return;
+
+    const settings = getSettings();
+    const isCacheActive = settings.trackCache !== false;
+    const totalTokens = chartData.reduce((acc, d) => acc + (d.usage || 0), 0);
+
+    let html = '';
+
+    if (currentChartView === 'type') {
+        const totalIn = chartData.reduce((acc, d) => acc + (isCacheActive ? (d.input || 0) : ((d.input || 0) + (d.cache_read || 0))), 0);
+        const totalCache = isCacheActive ? chartData.reduce((acc, d) => acc + (d.cache_read || 0), 0) : 0;
+        const totalOut = chartData.reduce((acc, d) => acc + (d.output || 0), 0);
+
+        const inPct = totalTokens > 0 ? Math.round((totalIn / totalTokens) * 100) : 0;
+        const cachePct = totalTokens > 0 ? Math.round((totalCache / totalTokens) * 100) : 0;
+        const outPct = totalTokens > 0 ? Math.round((totalOut / totalTokens) * 100) : 0;
+
+        html += `
+            <div style="display: flex; align-items: center; gap: 5px; font-size: 10px;" title="非缓存输入: ${formatNumberFull(totalIn)} tokens">
+                <span style="display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: ${TOKEN_TYPE_COLORS.in}; flex-shrink: 0;"></span>
+                <span style="opacity: 0.75;">In (输入)</span>
+                <span style="font-weight: 600;">${formatNumberAdaptive(totalIn)}</span>
+                <span style="opacity: 0.45;">(${inPct}%)</span>
+            </div>
+        `;
+        if (isCacheActive) {
+            html += `
+                <div style="display: flex; align-items: center; gap: 5px; font-size: 10px;" title="缓存命中: ${formatNumberFull(totalCache)} tokens">
+                    <span style="display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: ${TOKEN_TYPE_COLORS.cache}; flex-shrink: 0;"></span>
+                    <span style="color: #60a5fa; font-weight: 600;">Cache (缓存)</span>
+                    <span style="color: #60a5fa; font-weight: 700;">${formatNumberAdaptive(totalCache)}</span>
+                    <span style="color: #60a5fa; opacity: 0.8;">(${cachePct}%)</span>
+                </div>
+            `;
+        }
+        html += `
+            <div style="display: flex; align-items: center; gap: 5px; font-size: 10px;" title="生成输出: ${formatNumberFull(totalOut)} tokens">
+                <span style="display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: ${TOKEN_TYPE_COLORS.out}; flex-shrink: 0;"></span>
+                <span style="opacity: 0.75;">Out (输出)</span>
+                <span style="font-weight: 600;">${formatNumberAdaptive(totalOut)}</span>
+                <span style="opacity: 0.45;">(${outPct}%)</span>
+            </div>
+        `;
+    } else {
+        // Model mode
+        const modelTotals = {};
+        for (const d of chartData) {
+            if (d.models) {
+                for (const [mId, mData] of Object.entries(d.models)) {
+                    const t = typeof mData === 'number' ? mData : (mData?.total || 0);
+                    modelTotals[mId] = (modelTotals[mId] || 0) + t;
+                }
+            }
+        }
+        const sortedModels = Object.entries(modelTotals).sort((a, b) => b[1] - a[1]);
+        if (sortedModels.length === 0) {
+            html = '<span style="opacity: 0.5; font-size: 10px;">暂无模型数据</span>';
+        } else {
+            for (const [mId, tokens] of sortedModels) {
+                const color = getModelColor(mId);
+                const pct = totalTokens > 0 ? Math.round((tokens / totalTokens) * 100) : 0;
+                const shortName = mId.length > 22 ? mId.substring(0, 19) + '...' : mId;
+                html += `
+                    <div style="display: flex; align-items: center; gap: 5px; font-size: 10px;" title="${mId}: ${formatNumberFull(tokens)} tokens">
+                        <span style="display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: ${color}; flex-shrink: 0;"></span>
+                        <span style="max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: 0.85;">${shortName}</span>
+                        <span style="font-weight: 600;">${formatNumberAdaptive(tokens)}</span>
+                        <span style="opacity: 0.45;">(${pct}%)</span>
+                    </div>
+                `;
+            }
+        }
+    }
+
+    legendEl.innerHTML = html;
 }
 
 function showTooltip(d) {
@@ -2251,6 +2364,19 @@ function updateChartRange(range) {
     });
 }
 
+function updateChartView(view) {
+    currentChartView = view;
+    document.querySelectorAll('.token-usage-view-btn').forEach(btn => {
+        const val = btn.getAttribute('data-view');
+        if (val === view) {
+            btn.classList.add('active');
+        } else {
+            btn.classList.remove('active');
+        }
+    });
+    renderChart();
+}
+
 /**
  * Update the stats display in the UI
  */
@@ -2374,13 +2500,20 @@ function createSettingsUI() {
                 <div class="inline-drawer-content">
                     <!-- Chart -->
                     <div class="token-usage-chart-shell" style="margin-bottom: 12px;">
-                        <div class="token-usage-range-controls" style="display: inline-flex; flex-wrap: wrap; justify-content: flex-end;">
-                            <button class="token-usage-range-btn menu_button" data-value="7" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">7D</button>
-                            <button class="token-usage-range-btn menu_button active" data-value="30" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">30D</button>
-                            <button class="token-usage-range-btn menu_button" data-value="90" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">90D</button>
-                            <button class="token-usage-range-btn menu_button" data-value="365" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">365D</button>
+                        <div class="token-usage-chart-toolbar" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; flex-wrap: wrap; gap: 4px;">
+                            <div class="token-usage-view-controls" style="display: inline-flex; gap: 2px;">
+                                <button class="token-usage-view-btn menu_button active" data-view="type" style="padding: 2px 8px; font-size: 10px; border-radius: 4px;" title="按输入/缓存/输出类型统计">按类型</button>
+                                <button class="token-usage-view-btn menu_button" data-view="model" style="padding: 2px 8px; font-size: 10px; border-radius: 4px;" title="按模型统计">按模型</button>
+                            </div>
+                            <div class="token-usage-range-controls" style="display: inline-flex; gap: 2px;">
+                                <button class="token-usage-range-btn menu_button" data-value="7" style="padding: 2px 8px; font-size: 10px; border-radius: 4px;">7D</button>
+                                <button class="token-usage-range-btn menu_button active" data-value="30" style="padding: 2px 8px; font-size: 10px; border-radius: 4px;">30D</button>
+                                <button class="token-usage-range-btn menu_button" data-value="90" style="padding: 2px 8px; font-size: 10px; border-radius: 4px;">90D</button>
+                                <button class="token-usage-range-btn menu_button" data-value="365" style="padding: 2px 8px; font-size: 10px; border-radius: 4px;">365D</button>
+                            </div>
                         </div>
-                        <div id="token-usage-chart" style="width: 100%; height: 320px; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; overflow: hidden;"></div>
+                        <div id="token-usage-chart" style="width: 100%; height: 260px; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; overflow: hidden;"></div>
+                        <div id="token-usage-chart-legend" style="display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 6px 12px; margin-top: 6px; padding: 6px 8px; font-size: 10px; color: var(--SmartThemeBodyColor); background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor);"></div>
                     </div>
 
                     <!-- Stats Grid (Today, Week, Month, All Time) -->
@@ -2524,6 +2657,13 @@ function createSettingsUI() {
     document.querySelectorAll('.token-usage-range-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             updateChartRange(parseInt(btn.getAttribute('data-value')));
+        });
+    });
+
+    // View button handlers
+    document.querySelectorAll('.token-usage-view-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            updateChartView(btn.getAttribute('data-view'));
         });
     });
 

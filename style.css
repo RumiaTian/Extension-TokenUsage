@@ -1,12 +1,12 @@
 /* Token Usage Tracker Extension Styles */
 
-/* Active state for range buttons */
+/* Active state for range and view buttons */
+.token-usage-range-btn.active,
+.token-usage-view-btn.active,
 .range-btn.active {
-  background-color: white;
-  color: #0f172a; /* slate-900 */
-  box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.05),
-    0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  background-color: var(--SmartThemeBodyColor) !important;
+  color: var(--SmartThemeInputColor) !important;
+  font-weight: 600;
 }
 
 /* Transition for the hover cursor rect in the graph */
@@ -33,13 +33,6 @@
 
 .token-usage-chart-shell {
   position: relative;
-}
-
-.token-usage-range-controls {
-  position: absolute;
-  top: 12px;
-  left: 6px;
-  z-index: 2;
 }
 
 /* Layout for the week/month/all-time stat cards */
