@@ -110,10 +110,19 @@ export function deserializeUsage(compact) {
             dayData.costedOutput = day.co || 0;
         }
 
+        let modelCrSum = 0;
         for (const row of (day.s || [])) {
             const modelId = models[row[0]];
             if (typeof modelId !== 'string') continue;
-            dayData.models[modelId] = rowToBucket(row);
+            const b = rowToBucket(row);
+            dayData.models[modelId] = b;
+            modelCrSum += (b.cache_read || 0);
+        }
+
+        // Fallback for days where day.cr was omitted but model rows have cache_read
+        if (!dayData.cache_read && modelCrSum > 0) {
+            dayData.cache_read = modelCrSum;
+            dayData.total = dayData.input + dayData.output + dayData.cache_read;
         }
 
         runtime.byDay[day.d] = dayData;
@@ -259,11 +268,14 @@ function csvEscape(value) {
  * Build a CSV of the full usage history: one row per day x model.
  * @param {object} runtime { byDay }
  * @param {(bucket: object, modelId: string|null) => number} costFn stored-or-estimated cost
+ * @param {boolean} [isCacheActive=true] whether prompt cache is tracked separately
  * @returns {string} CSV text
  */
-export function buildUsageCsv(runtime, costFn) {
+export function buildUsageCsv(runtime, costFn, isCacheActive = true) {
     const byDay = (runtime && runtime.byDay) || {};
-    const lines = ['date,model,input_tokens,cache_tokens,output_tokens,total_tokens,requests,cost_usd'];
+    const lines = isCacheActive
+        ? ['date,model,input_tokens,cache_tokens,output_tokens,total_tokens,requests,cost_usd']
+        : ['date,model,input_tokens,output_tokens,total_tokens,requests,cost_usd'];
 
     for (const dayKey of Object.keys(byDay).sort()) {
         const day = byDay[dayKey];
@@ -274,21 +286,39 @@ export function buildUsageCsv(runtime, costFn) {
         let modelOutput = 0;
         let modelRequests = 0;
         for (const [modelId, modelData] of modelEntries) {
-            modelInput += modelData.input || 0;
-            modelCache += modelData.cache_read || 0;
-            modelOutput += modelData.output || 0;
-            modelRequests += modelData.messageCount || 0;
+            const inTokens = modelData.input || 0;
+            const crTokens = modelData.cache_read || 0;
+            const outTokens = modelData.output || 0;
+            const reqs = modelData.messageCount || 0;
+
+            modelInput += inTokens;
+            modelCache += crTokens;
+            modelOutput += outTokens;
+            modelRequests += reqs;
             const cost = Number((costFn ? costFn(modelData, modelId) : 0).toFixed(6));
-            lines.push([
-                dayKey,
-                csvEscape(modelId),
-                modelData.input || 0,
-                modelData.cache_read || 0,
-                modelData.output || 0,
-                modelData.total != null ? modelData.total : (modelData.input || 0) + (modelData.output || 0) + (modelData.cache_read || 0),
-                modelData.messageCount || 0,
-                cost,
-            ].join(','));
+
+            if (isCacheActive) {
+                lines.push([
+                    dayKey,
+                    csvEscape(modelId),
+                    inTokens,
+                    crTokens,
+                    outTokens,
+                    modelData.total != null ? modelData.total : (inTokens + outTokens + crTokens),
+                    reqs,
+                    cost,
+                ].join(','));
+            } else {
+                lines.push([
+                    dayKey,
+                    csvEscape(modelId),
+                    inTokens + crTokens,
+                    outTokens,
+                    inTokens + crTokens + outTokens,
+                    reqs,
+                    cost,
+                ].join(','));
+            }
         }
 
         // Background/quiet generations are recorded without a model ID and only
@@ -299,16 +329,28 @@ export function buildUsageCsv(runtime, costFn) {
         const unattributedRequests = (day.messageCount || 0) - modelRequests;
         if (unattributedInput > 0 || unattributedCache > 0 || unattributedOutput > 0 || unattributedRequests > 0) {
             const cost = Number((costFn ? costFn(day, null) : 0).toFixed(6));
-            lines.push([
-                dayKey,
-                '(unattributed)',
-                unattributedInput,
-                unattributedCache,
-                unattributedOutput,
-                unattributedInput + unattributedOutput + unattributedCache,
-                unattributedRequests,
-                cost,
-            ].join(','));
+            if (isCacheActive) {
+                lines.push([
+                    dayKey,
+                    '(unattributed)',
+                    unattributedInput,
+                    unattributedCache,
+                    unattributedOutput,
+                    unattributedInput + unattributedOutput + unattributedCache,
+                    unattributedRequests,
+                    cost,
+                ].join(','));
+            } else {
+                lines.push([
+                    dayKey,
+                    '(unattributed)',
+                    unattributedInput + unattributedCache,
+                    unattributedOutput,
+                    unattributedInput + unattributedOutput + unattributedCache,
+                    unattributedRequests,
+                    cost,
+                ].join(','));
+            }
         }
     }
 
